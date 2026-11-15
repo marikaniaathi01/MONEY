@@ -29,7 +29,7 @@ import {
   type Transaction, type DataDoc, type GitConfig, type Profile,
   SESSION_KEY, emptyDoc, sanitizeTransactions, mergeDocs, sameDoc, parseCSV,
   loadLocalDoc, saveLocalDoc, loadConfig, saveConfig, loadProfile, saveProfile, wipeDevice,
-  hashPin, verifyRepo, syncDoc, describeError,
+  hashPin, verifyRepo, syncDoc, describeError, buildSetupLink, readSetupLink,
 } from './store';
 
 // Use local calendar dates (toISOString() uses UTC and can show yesterday in India).
@@ -91,9 +91,10 @@ export default function App() {
   const [loginNameInput, setLoginNameInput] = useState<string>('');
   const [loginPinInput, setLoginPinInput] = useState<string>('');
   const [confirmPinInput, setConfirmPinInput] = useState<string>('');
-  const [setupOwner, setSetupOwner] = useState<string>('');
-  const [setupRepo, setSetupRepo] = useState<string>('moneymate-data');
-  const [setupToken, setSetupToken] = useState<string>('');
+  const [fromLink] = useState<boolean>(() => !!readSetupLink());
+  const [setupOwner, setSetupOwner] = useState<string>(() => readSetupLink()?.owner || '');
+  const [setupRepo, setSetupRepo] = useState<string>(() => readSetupLink()?.repo || 'moneymate-data');
+  const [setupToken, setSetupToken] = useState<string>(() => readSetupLink()?.token || '');
   const [setupBusy, setSetupBusy] = useState<boolean>(false);
   const [authError, setAuthError] = useState<string>('');
   const [authSuccess, setAuthSuccess] = useState<string>('');
@@ -179,6 +180,34 @@ export default function App() {
       window.removeEventListener('online', onWake);
     };
   }, [isLoggedIn]);
+
+  // Remove the setup details from the address bar as soon as the page has read them.
+  useEffect(() => {
+    if (window.location.hash.includes('setup=')) {
+      window.history.replaceState(null, '', window.location.pathname + window.location.search);
+    }
+  }, []);
+
+  const handleShareSetup = async () => {
+    const cfg = loadConfig();
+    if (!cfg) return;
+    if (!window.confirm('This setup link contains your GitHub token. Send it only to family members you trust, in a private message, and delete the message afterwards. Continue?')) return;
+    const link = buildSetupLink(cfg);
+    try {
+      if (navigator.share) {
+        await navigator.share({ title: 'MoneyMate setup', text: 'Open this link on your phone to connect MoneyMate:', url: link });
+        return;
+      }
+    } catch (error: any) {
+      if (error?.name === 'AbortError') return;
+    }
+    try {
+      await navigator.clipboard.writeText(link);
+      showToast('Setup link copied. Paste it into a private message.', 'success');
+    } catch {
+      window.prompt('Copy this setup link:', link);
+    }
+  };
 
   const resetDeviceState = () => {
     wipeDevice();
@@ -907,6 +936,13 @@ export default function App() {
             </div>
           )}
 
+          {isSetup && fromLink && (
+            <div className="mb-4 p-3 bg-sky-50 text-[#1685c5] text-xs rounded-xl flex items-center gap-2 border border-sky-200 text-left">
+              <CheckCircle2 className="w-4 h-4 shrink-0" />
+              <span>Connection details were filled in from your setup link. Just add a family name and a PIN, then tap Connect &amp; Start.</span>
+            </div>
+          )}
+
           <form onSubmit={handleAuthSubmit} className="space-y-4 text-left">
             {isSetup && (
               <>
@@ -1225,6 +1261,7 @@ export default function App() {
         {syncState === 'ok' && lastSynced && <span className="opacity-70">at {lastSynced}</span>}
         {syncState === 'error' && syncMessage && <span className="text-red-600">{syncMessage}</span>}
         <button onClick={() => { void runSync(true); }} className="font-semibold text-[#168ed5] hover:underline cursor-pointer">Sync now</button>
+        <button onClick={() => { void handleShareSetup(); }} className="font-semibold text-[#168ed5] hover:underline cursor-pointer">Share setup link</button>
         <button onClick={() => { void handleDisconnect(); }} className="font-semibold text-[#df6174] hover:underline cursor-pointer">Disconnect this device</button>
       </div>
 

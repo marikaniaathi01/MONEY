@@ -277,6 +277,29 @@ export async function syncDoc(cfg: GitConfig, local: DataDoc): Promise<DataDoc> 
   }
 }
 
+// ---------- setup link: lets a trusted family member connect a new phone with one tap ----------
+// The details travel in the part of the link after "#", which browsers never send to any server.
+
+export function buildSetupLink(cfg: GitConfig): string {
+  const payload = btoa(JSON.stringify({ o: cfg.owner, r: cfg.repo, t: cfg.token }))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  return `${window.location.origin}${window.location.pathname}#setup=${payload}`;
+}
+
+export function readSetupLink(): { owner: string; repo: string; token: string } | null {
+  try {
+    const m = window.location.hash.match(/[#&]setup=([A-Za-z0-9_-]+)/);
+    if (!m) return null;
+    let b = m[1].replace(/-/g, '+').replace(/_/g, '/');
+    while (b.length % 4) b += '=';
+    const j = JSON.parse(atob(b));
+    if (typeof j.o === 'string' && typeof j.r === 'string' && typeof j.t === 'string') {
+      return { owner: j.o, repo: j.r, token: j.t };
+    }
+  } catch { /* not a valid setup link */ }
+  return null;
+}
+
 export function describeError(e: unknown): string {
   if (e instanceof GitError) {
     if (e.status === 401) return 'GitHub rejected the token (invalid or expired). Create a new token and reconnect this device.';

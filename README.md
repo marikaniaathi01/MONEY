@@ -17,7 +17,7 @@ Records are stored in **a private GitHub repository** (one file, `data.json`), s
 1. Create a **Private** repo named `moneymate-data` (tick "Add a README file").
 2. Create a fine-grained token: GitHub -> Settings -> Developer settings -> Personal access tokens -> Fine-grained tokens.
    Repository access: **Only select repositories** -> `moneymate-data`. Permissions -> Repository permissions -> **Contents: Read and write**.
-3. Open the site, fill the setup screen on each device (use the same token on every device).
+3. Open the site and fill the setup screen on the first device. On a connected device tap **Share setup link** and send the link privately to a family phone: it fills in the GitHub details, so only a name and PIN are needed there.
 
 ## Safety notes
 - The token is stored on that device (browser storage). It can only reach the one data repo.
