@@ -1,20 +1,34 @@
 # MoneyMate — Family Finance Tracker
 
-React + TypeScript + Vite app. **No backend, no database, no login server.**
-All records are stored in the browser (localStorage) on each device and the site is hosted free on GitHub Pages.
+React + TypeScript + Vite app, hosted free on GitHub Pages.
+Records are stored in **a private GitHub repository** (one file, `data.json`), so every device
+(Android, iOS, Windows...) that is connected to it shows the same data. No SQL, no server.
 
-- First visit: create a family name and a 4-8 digit PIN (a privacy lock for the screen).
-- **JSON Backup** downloads all records. **Import** restores them (JSON, or a CSV exported from Supabase). Importing merges by record ID, so it will not duplicate.
-- Data is per device/browser. Another phone or browser starts empty until you Import a backup there.
-- Clearing browser data deletes the records, so download a backup regularly. Never commit backup files to the repo.
+## How it works
+- The website repo (`MONEY`) is public and holds only the app code.
+- A second repo, **private**, called `moneymate-data` holds `data.json` (your records).
+- Each device is set up once with: family name, GitHub username, data repo name, an access token and a PIN.
+- The app saves on the device first, then syncs with GitHub (when you save, every 30 seconds, and when the app is reopened).
+- Works offline: changes stay on the device and sync when the internet is back.
+- Deletes are tracked, so a record deleted on one phone does not come back from another.
+- **JSON Backup / Import** still work. Import also accepts a CSV exported from Supabase.
+
+## One-time setup
+1. Create a **Private** repo named `moneymate-data` (tick "Add a README file").
+2. Create a fine-grained token: GitHub -> Settings -> Developer settings -> Personal access tokens -> Fine-grained tokens.
+   Repository access: **Only select repositories** -> `moneymate-data`. Permissions -> Repository permissions -> **Contents: Read and write**.
+3. Open the site, fill the setup screen on each device (use the same token on every device).
+
+## Safety notes
+- The token is stored on that device (browser storage). It can only reach the one data repo.
+- The PIN is only a screen lock for that device.
+- Never put `data.json` or backup files in the public repo.
 
 ## Run locally
 ```
 npm install
 npm run dev
 ```
-Open http://localhost:3000
 
 ## Deploy (GitHub Pages)
-Push to the `main` branch. In the repo go to Settings -> Pages -> Source -> **GitHub Actions**.
-The workflow in `.github/workflows/deploy.yml` builds and publishes the site automatically.
+Push to `main`. Settings -> Pages -> Source -> **GitHub Actions**. The workflow in `.github/workflows/deploy.yml` builds and publishes.

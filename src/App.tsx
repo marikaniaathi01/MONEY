@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import jsPDF from 'jspdf';
 import {
   Wallet,
@@ -25,112 +25,12 @@ import {
   Sparkles,
   FileSpreadsheet
 } from 'lucide-react';
-
-interface Transaction {
-  id: string;
-  type: 'income' | 'savings' | 'expenses' | 'loan';
-  loanAction?: 'taken' | 'repaid';
-  amount: number;
-  category: string;
-  date: string;
-  note: string;
-}
-
-const STORE_KEY = 'moneymate_transactions';
-const PROFILE_KEY = 'moneymate_profile';
-const SESSION_KEY = 'moneymate_unlocked';
-
-interface Profile {
-  name: string;
-  pinHash: string;
-}
-
-// Hash the PIN so it is not stored as plain text. This is a privacy lock for the screen,
-// not bank-grade security: the data itself lives unencrypted in this browser.
-async function hashPin(pin: string): Promise<string> {
-  const text = 'moneymate:' + pin;
-  try {
-    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
-    return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
-  } catch {
-    return btoa(text);
-  }
-}
-
-function loadProfile(): Profile | null {
-  try {
-    const raw = localStorage.getItem(PROFILE_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed.name === 'string' && typeof parsed.pinHash === 'string' ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-// Accepts MoneyMate backups, the old local format, and rows exported from Supabase (loan_action).
-function sanitizeTransactions(list: any[]): Transaction[] {
-  const byId = new Map<string, Transaction>();
-  for (const t of list) {
-    if (!t || !['income', 'savings', 'expenses', 'loan'].includes(t.type)) continue;
-    const amount = Number(t.amount);
-    if (!Number.isFinite(amount) || amount <= 0) continue;
-    if (typeof t.category !== 'string' || !t.category.trim()) continue;
-    const date = String(t.date || '').slice(0, 10);
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
-    const id = typeof t.id === 'string' && t.id ? t.id : crypto.randomUUID();
-    const action = t.loanAction ?? t.loan_action;
-    byId.set(id, {
-      id,
-      type: t.type,
-      ...(t.type === 'loan' ? { loanAction: action === 'repaid' ? 'repaid' : 'taken' } : {}),
-      amount,
-      category: t.category.trim(),
-      date,
-      note: String(t.note || ''),
-    } as Transaction);
-  }
-  return Array.from(byId.values());
-}
-
-function loadTransactions(): Transaction[] {
-  try {
-    const raw = localStorage.getItem(STORE_KEY);
-    const parsed = raw ? JSON.parse(raw) : [];
-    return Array.isArray(parsed) ? sanitizeTransactions(parsed) : [];
-  } catch {
-    return [];
-  }
-}
-
-// Minimal CSV parser (quoted fields, commas and line breaks inside quotes).
-function parseCSV(text: string): Record<string, string>[] {
-  const rows: string[][] = [];
-  let row: string[] = [];
-  let field = '';
-  let quoted = false;
-  const src = text.replace(/^\uFEFF/, '');
-  for (let i = 0; i < src.length; i++) {
-    const c = src[i];
-    if (quoted) {
-      if (c === '"' && src[i + 1] === '"') { field += '"'; i++; }
-      else if (c === '"') quoted = false;
-      else field += c;
-    } else if (c === '"') quoted = true;
-    else if (c === ',') { row.push(field); field = ''; }
-    else if (c === '\n' || c === '\r') {
-      if (c === '\r' && src[i + 1] === '\n') i++;
-      row.push(field); field = '';
-      if (row.some(v => v !== '')) rows.push(row);
-      row = [];
-    } else field += c;
-  }
-  row.push(field);
-  if (row.some(v => v !== '')) rows.push(row);
-  if (rows.length < 2) return [];
-  const header = rows[0].map(h => h.trim());
-  return rows.slice(1).map(r => Object.fromEntries(header.map((h, i) => [h, r[i] ?? ''])));
-}
+import {
+  type Transaction, type DataDoc, type GitConfig, type Profile,
+  SESSION_KEY, emptyDoc, sanitizeTransactions, mergeDocs, sameDoc, parseCSV,
+  loadLocalDoc, saveLocalDoc, loadConfig, saveConfig, loadProfile, saveProfile, wipeDevice,
+  hashPin, verifyRepo, syncDoc, describeError,
+} from './store';
 
 // Use local calendar dates (toISOString() uses UTC and can show yesterday in India).
 const currentDateString = () => {
@@ -173,15 +73,28 @@ function formatMonthReadable(monthKey: string): string {
 
 
 export default function App() {
-  // Local PIN lock (data stays in this browser; there is no server)
-  const [profile, setProfile] = useState<Profile | null>(() => loadProfile());
-  const [isLoggedIn, setIsLoggedIn] = useState<boolean>(() => !!loadProfile() && sessionStorage.getItem(SESSION_KEY) === '1');
-  const [adminName, setAdminName] = useState<string>(() => loadProfile()?.name || '');
+  // Local copy of the ledger (also cached in localStorage) and its sync with the private GitHub repo
+  const docRef = useRef<DataDoc | null>(null);
+  if (docRef.current === null) docRef.current = loadLocalDoc();
+  const syncingRef = useRef(false);
+  const pendingRef = useRef(false);
 
-  // Form states for the lock screen
+  const [profile, setProfile] = useState<Profile | null>(() => loadProfile());
+  const [config, setConfig] = useState<GitConfig | null>(() => loadConfig());
+  const [isLoggedIn, setIsLoggedIn] = useState<boolean>(() => !!loadProfile() && !!loadConfig() && sessionStorage.getItem(SESSION_KEY) === '1');
+  const [adminName, setAdminName] = useState<string>(() => loadProfile()?.name || '');
+  const [syncState, setSyncState] = useState<'idle' | 'syncing' | 'ok' | 'error'>('idle');
+  const [syncMessage, setSyncMessage] = useState<string>('');
+  const [lastSynced, setLastSynced] = useState<string>('');
+
+  // Form states for the lock / setup screen
   const [loginNameInput, setLoginNameInput] = useState<string>('');
   const [loginPinInput, setLoginPinInput] = useState<string>('');
   const [confirmPinInput, setConfirmPinInput] = useState<string>('');
+  const [setupOwner, setSetupOwner] = useState<string>('');
+  const [setupRepo, setSetupRepo] = useState<string>('moneymate-data');
+  const [setupToken, setSetupToken] = useState<string>('');
+  const [setupBusy, setSetupBusy] = useState<boolean>(false);
   const [authError, setAuthError] = useState<string>('');
   const [authSuccess, setAuthSuccess] = useState<string>('');
 
@@ -193,7 +106,7 @@ export default function App() {
   const [entryType, setEntryType] = useState<'income' | 'savings' | 'expenses' | 'loan'>('expenses');
 
   // Data
-  const [transactions, setTransactions] = useState<Transaction[]>(() => loadTransactions());
+  const [transactions, setTransactions] = useState<Transaction[]>(() => docRef.current!.transactions);
 
   // Entry forms
   const [incomeForm, setIncomeForm] = useState({ amount: '', category: '', date: currentDateString(), note: '' });
@@ -218,6 +131,69 @@ export default function App() {
     }, 3200);
   };
 
+  // Save a new ledger on this device, then sync it to GitHub in the background.
+  const applyDoc = (doc: DataDoc) => {
+    saveLocalDoc(doc);
+    docRef.current = doc;
+    setTransactions(doc.transactions);
+  };
+
+  const runSync = async (manual = false) => {
+    const cfg = loadConfig();
+    if (!cfg) return;
+    if (syncingRef.current) { pendingRef.current = true; return; }
+    syncingRef.current = true;
+    setSyncState('syncing');
+    try {
+      const synced = await syncDoc(cfg, docRef.current!);
+      // Merge again in case something was added while the network call was running.
+      const latest = mergeDocs(docRef.current!, synced);
+      if (!sameDoc(latest, docRef.current!)) applyDoc(latest);
+      if (!sameDoc(latest, synced)) pendingRef.current = true;
+      setSyncState('ok');
+      setSyncMessage('');
+      setLastSynced(new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }));
+      if (manual) showToast('Synced with GitHub.', 'success');
+    } catch (error) {
+      console.error('Sync failed:', error);
+      setSyncState('error');
+      setSyncMessage(describeError(error));
+      if (manual) showToast(describeError(error), 'error');
+    } finally {
+      syncingRef.current = false;
+      if (pendingRef.current) { pendingRef.current = false; void runSync(); }
+    }
+  };
+
+  // Sync when the app opens, every 30 seconds while visible, and when the tab/phone comes back online.
+  useEffect(() => {
+    if (!isLoggedIn) return;
+    void runSync();
+    const timer = window.setInterval(() => { if (document.visibilityState === 'visible') void runSync(); }, 30000);
+    const onWake = () => { void runSync(); };
+    window.addEventListener('focus', onWake);
+    window.addEventListener('online', onWake);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('focus', onWake);
+      window.removeEventListener('online', onWake);
+    };
+  }, [isLoggedIn]);
+
+  const resetDeviceState = () => {
+    wipeDevice();
+    docRef.current = emptyDoc();
+    setTransactions([]);
+    setProfile(null);
+    setConfig(null);
+    setAdminName('');
+    setIsLoggedIn(false);
+    setSyncState('idle');
+    setLoginPinInput('');
+    setConfirmPinInput('');
+    setSetupToken('');
+  };
+
   const handleAuthSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError('');
@@ -227,41 +203,82 @@ export default function App() {
       setAuthError('PIN must be 4 to 8 digits.');
       return;
     }
-    if (!profile) {
-      const name = loginNameInput.trim();
-      if (!name) { setAuthError('Please enter your family name.'); return; }
-      if (pin !== confirmPinInput) { setAuthError('PIN confirmation does not match.'); return; }
-      const created: Profile = { name, pinHash: await hashPin(pin) };
-      localStorage.setItem(PROFILE_KEY, JSON.stringify(created));
+
+    // Unlock an already set-up device
+    if (profile && config) {
+      if ((await hashPin(pin)) !== profile.pinHash) {
+        setAuthError('Incorrect PIN. Please try again.');
+        return;
+      }
       sessionStorage.setItem(SESSION_KEY, '1');
+      setAdminName(profile.name);
+      setIsLoggedIn(true);
+      setLoginPinInput('');
+      showToast(`Welcome back, ${profile.name}!`);
+      return;
+    }
+
+    // First-time setup of this device
+    const name = loginNameInput.trim();
+    const owner = setupOwner.trim();
+    const repo = setupRepo.trim();
+    const token = setupToken.trim();
+    if (!name) { setAuthError('Please enter your family name.'); return; }
+    if (!owner || !repo || !token) { setAuthError('Enter the GitHub username, data repository name and token.'); return; }
+    if (pin !== confirmPinInput) { setAuthError('PIN confirmation does not match.'); return; }
+
+    setSetupBusy(true);
+    try {
+      const cfg: GitConfig = { owner, repo, token, path: 'data.json' };
+      const info = await verifyRepo(cfg);
+      if (!info.isPrivate) {
+        setAuthError('This repository is public. Your money records would be visible to everyone. Make the data repository Private and try again.');
+        return;
+      }
+      // Pull what is already in GitHub and merge it with anything saved earlier on this device.
+      const synced = await syncDoc(cfg, docRef.current!);
+      saveConfig(cfg);
+      const created: Profile = { name, pinHash: await hashPin(pin) };
+      saveProfile(created);
+      applyDoc(synced);
+      sessionStorage.setItem(SESSION_KEY, '1');
+      setConfig(cfg);
       setProfile(created);
       setAdminName(name);
+      setSyncState('ok');
+      setLastSynced(new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }));
       setIsLoggedIn(true);
       setLoginPinInput('');
       setConfirmPinInput('');
-      showToast(`Welcome to MoneyMate, ${name}!`);
-      return;
+      setSetupToken('');
+      showToast(`Connected! ${synced.transactions.length} records loaded.`);
+    } catch (error) {
+      console.error('Setup failed:', error);
+      setAuthError(describeError(error));
+    } finally {
+      setSetupBusy(false);
     }
-    if ((await hashPin(pin)) !== profile.pinHash) {
-      setAuthError('Incorrect PIN. Please try again.');
-      return;
-    }
-    sessionStorage.setItem(SESSION_KEY, '1');
-    setAdminName(profile.name);
-    setIsLoggedIn(true);
-    setLoginPinInput('');
-    showToast(`Welcome back, ${profile.name}!`);
   };
 
   const handleForgotPin = () => {
-    if (!window.confirm('This removes the PIN lock only. Your saved records stay on this device. Continue?')) return;
-    localStorage.removeItem(PROFILE_KEY);
-    sessionStorage.removeItem(SESSION_KEY);
-    setProfile(null);
-    setLoginPinInput('');
-    setConfirmPinInput('');
+    if (!window.confirm('This removes the PIN, the GitHub token and the local copy from THIS device only. Your records stay safe in GitHub. Changes not yet synced from this device would be lost. Continue?')) return;
+    resetDeviceState();
     setAuthError('');
-    setAuthSuccess('PIN removed. Create a new PIN to continue.');
+    setAuthSuccess('This device was reset. Set it up again with your GitHub details and a new PIN.');
+  };
+
+  const handleDisconnect = async () => {
+    if (!window.confirm('Disconnect this device? Your records stay safe in GitHub. The token, PIN and local copy are removed from this device.')) return;
+    const cfg = loadConfig();
+    if (cfg) {
+      try {
+        await syncDoc(cfg, docRef.current!);
+      } catch {
+        if (!window.confirm('Your latest changes could not be synced. They will be lost if you disconnect now. Disconnect anyway?')) return;
+      }
+    }
+    resetDeviceState();
+    setAuthSuccess('This device was disconnected.');
   };
 
   const handleLogout = () => {
@@ -275,13 +292,18 @@ export default function App() {
 
   const saveTransactionsToStorage = async (updated: Transaction[]) => {
     try {
-      localStorage.setItem(STORE_KEY, JSON.stringify(updated));
-      setTransactions(updated);
+      const prev = docRef.current!;
+      const keep = new Set(updated.map(t => t.id));
+      const deleted = { ...prev.deleted };
+      const now = new Date().toISOString();
+      prev.transactions.forEach(t => { if (!keep.has(t.id)) deleted[t.id] = now; });
+      applyDoc({ version: 2, transactions: updated, deleted });
     } catch (error) {
       console.error('Could not save MoneyMate data:', error);
       showToast('Could not save data in this browser (storage may be full or blocked). Your changes were not applied.', 'error');
       throw error;
     }
+    void runSync();
   };
 
   const handleExportBackup = () => {
@@ -310,7 +332,9 @@ export default function App() {
         list = Array.isArray(parsed) ? parsed : parsed.transactions;
       }
       if (!Array.isArray(list)) throw new Error('This file does not contain a MoneyMate transactions list.');
-      const imported = sanitizeTransactions(list);
+      // A record that was deleted earlier gets a fresh id so the delete does not cancel the import.
+      const imported = sanitizeTransactions(list).map(t =>
+        Object.prototype.hasOwnProperty.call(docRef.current!.deleted, t.id) ? { ...t, id: crypto.randomUUID() } : t);
       if (!imported.length) throw new Error('No valid transactions were found in this file.');
       // Merge by id: matching records are updated, new ones are added.
       const merged = new Map<string, Transaction>();
@@ -850,23 +874,23 @@ export default function App() {
     }
   };
 
-  // Lock screen (first visit: create a PIN; later visits: enter the PIN)
+  // Lock screen (new device: connect GitHub + create a PIN; later visits: enter the PIN)
   if (!isLoggedIn) {
-    const isSetup = !profile;
+    const isSetup = !profile || !config;
     const inputCls = "w-full pl-10 pr-3.5 py-3 text-sm bg-[#f8fcff] border border-[#d6e9f6] rounded-xl outline-none text-[#244a65] placeholder:text-gray-400 focus:border-[#168ed5] focus:ring-2 focus:ring-[#168ed5]/20 transition-all";
     return (
       <div className="min-h-screen flex items-center justify-center p-4 bg-gradient-to-br from-[#127dc0] via-[#359edc] to-[#65c3f6] relative overflow-hidden font-sans">
         <div className="absolute -top-24 -left-24 w-96 h-96 bg-white/10 rounded-full blur-2xl pointer-events-none" />
         <div className="absolute -bottom-24 -right-24 w-96 h-96 bg-blue-300/20 rounded-full blur-2xl pointer-events-none" />
 
-        <div className="bg-white/95 backdrop-blur-md w-full max-w-[400px] p-8 sm:p-9 rounded-[28px] text-center shadow-[0_20px_50px_rgba(21,93,145,0.25)] border border-white/60 relative z-10 transition-all">
+        <div className="bg-white/95 backdrop-blur-md w-full max-w-[420px] p-8 sm:p-9 rounded-[28px] text-center shadow-[0_20px_50px_rgba(21,93,145,0.25)] border border-white/60 relative z-10 transition-all">
           <div className="w-[74px] h-[74px] mx-auto mb-3.5 rounded-[22px] bg-gradient-to-tr from-[#168ed5] to-[#83d4ff] flex items-center justify-center text-4xl shadow-[0_8px_20px_rgba(128,202,255,0.6)] text-white select-none">
             💰
           </div>
 
           <h1 className="text-3xl font-extrabold text-[#1685c5] tracking-tight">MoneyMate</h1>
           <p className="text-xs text-[#849bad] font-medium mt-1.5 mb-6">
-            {isSetup ? 'Welcome! Create a PIN to lock your family tracker' : `Welcome back, ${profile.name}`}
+            {isSetup ? 'Set up this device: connect your private GitHub data repository' : `Welcome back, ${profile?.name}`}
           </p>
 
           {authError && (
@@ -885,17 +909,31 @@ export default function App() {
 
           <form onSubmit={handleAuthSubmit} className="space-y-4 text-left">
             {isSetup && (
-              <div>
-                <label className="block text-xs font-bold text-[#244a65] mb-1.5">Family / Display Name</label>
-                <div className="relative">
-                  <input type="text" autoComplete="off" value={loginNameInput} onChange={e => setLoginNameInput(e.target.value)} placeholder="e.g. Our Family" required className={inputCls} />
-                  <User className="w-4 h-4 text-[#849bad] absolute left-3.5 top-3.5 pointer-events-none" />
+              <>
+                <div>
+                  <label className="block text-xs font-bold text-[#244a65] mb-1.5">Family / Display Name</label>
+                  <div className="relative">
+                    <input type="text" autoComplete="off" value={loginNameInput} onChange={e => setLoginNameInput(e.target.value)} placeholder="e.g. Our Family" required className={inputCls} />
+                    <User className="w-4 h-4 text-[#849bad] absolute left-3.5 top-3.5 pointer-events-none" />
+                  </div>
                 </div>
-              </div>
+                <div>
+                  <label className="block text-xs font-bold text-[#244a65] mb-1.5">GitHub username (owner of the data repo)</label>
+                  <input type="text" autoComplete="off" autoCapitalize="none" value={setupOwner} onChange={e => setSetupOwner(e.target.value)} placeholder="e.g. marikaniaathi01" required className={inputCls.replace('pl-10', 'pl-3.5')} />
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-[#244a65] mb-1.5">Private data repository name</label>
+                  <input type="text" autoComplete="off" autoCapitalize="none" value={setupRepo} onChange={e => setSetupRepo(e.target.value)} placeholder="moneymate-data" required className={inputCls.replace('pl-10', 'pl-3.5')} />
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-[#244a65] mb-1.5">GitHub access token</label>
+                  <input type="password" autoComplete="off" autoCapitalize="none" value={setupToken} onChange={e => setSetupToken(e.target.value)} placeholder="github_pat_..." required className={inputCls.replace('pl-10', 'pl-3.5') + ' font-mono'} />
+                </div>
+              </>
             )}
 
             <div>
-              <label className="block text-xs font-bold text-[#244a65] mb-1.5">{isSetup ? 'Create PIN (4-8 digits)' : 'PIN'}</label>
+              <label className="block text-xs font-bold text-[#244a65] mb-1.5">{isSetup ? 'Create PIN for this device (4-8 digits)' : 'PIN'}</label>
               <div className="relative">
                 <input type="password" inputMode="numeric" autoComplete="off" maxLength={8} value={loginPinInput} onChange={e => setLoginPinInput(e.target.value.replace(/\D/g, ''))} placeholder="Enter PIN" required className={inputCls + ' tracking-widest font-mono'} />
                 <Lock className="w-4 h-4 text-[#849bad] absolute left-3.5 top-3.5 pointer-events-none" />
@@ -914,9 +952,10 @@ export default function App() {
 
             <button
               type="submit"
-              className="w-full py-3.5 px-4 mt-2 bg-gradient-to-r from-[#1389d0] to-[#62c4fa] hover:from-[#117fbf] hover:to-[#55b9ee] text-white font-bold text-sm rounded-xl shadow-[0_6px_16px_rgba(165,218,250,0.8)] active:translate-y-0.5 transition-all cursor-pointer"
+              disabled={setupBusy}
+              className="w-full py-3.5 px-4 mt-2 bg-gradient-to-r from-[#1389d0] to-[#62c4fa] hover:from-[#117fbf] hover:to-[#55b9ee] disabled:opacity-60 text-white font-bold text-sm rounded-xl shadow-[0_6px_16px_rgba(165,218,250,0.8)] active:translate-y-0.5 transition-all cursor-pointer"
             >
-              {isSetup ? 'Create PIN & Start' : 'Unlock MoneyMate'}
+              {setupBusy ? 'Connecting…' : isSetup ? 'Connect & Start' : 'Unlock MoneyMate'}
             </button>
           </form>
 
@@ -927,8 +966,8 @@ export default function App() {
           )}
 
           <div className="mt-6 pt-4 border-t border-gray-100 text-xs text-[#849bad] text-left leading-relaxed">
-            <span className="flex items-center gap-1.5 font-semibold mb-2"><Lock className="w-3.5 h-3.5 text-emerald-500" /> Private &amp; offline</span>
-            Your records are saved only in this browser on this device. Nothing is sent to a server. Use JSON Backup regularly.
+            <span className="flex items-center gap-1.5 font-semibold mb-2"><Lock className="w-3.5 h-3.5 text-emerald-500" /> Shared through your private GitHub repo</span>
+            Records are saved in a private GitHub repository so every device shows the same data. The token and PIN stay on this device only.
           </div>
         </div>
       </div>
@@ -1176,6 +1215,18 @@ export default function App() {
           </button>
         </div>
       </header>
+
+      {/* SYNC STATUS */}
+      <div className="bg-white/80 border-b border-[#d7e9f5] text-[11px] text-[#587a92] px-4 sm:px-8 py-1.5 flex flex-wrap items-center gap-x-3 gap-y-1">
+        <span className={syncState === 'error' ? 'font-bold text-red-600' : 'font-bold text-[#168ed5]'}>
+          {syncState === 'syncing' ? '⏳ Syncing…' : syncState === 'error' ? '⚠ Not synced' : syncState === 'ok' ? '✅ Synced' : '☁ GitHub storage'}
+        </span>
+        {config && <span className="opacity-70">{config.owner}/{config.repo}</span>}
+        {syncState === 'ok' && lastSynced && <span className="opacity-70">at {lastSynced}</span>}
+        {syncState === 'error' && syncMessage && <span className="text-red-600">{syncMessage}</span>}
+        <button onClick={() => { void runSync(true); }} className="font-semibold text-[#168ed5] hover:underline cursor-pointer">Sync now</button>
+        <button onClick={() => { void handleDisconnect(); }} className="font-semibold text-[#df6174] hover:underline cursor-pointer">Disconnect this device</button>
+      </div>
 
       {/* MAIN CONTAINER */}
       <main className="max-w-[1080px] mx-auto p-4 sm:p-6 lg:p-8 space-y-6">
